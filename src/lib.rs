@@ -591,7 +591,7 @@ struct Transitions {
 struct Transition {
     pub start: Ident,
     pub message: Type,
-    pub end: Vec<Ident>,
+    pub end: Vec<(Ident, bool)>,
     pub async_transitions: HashSet<Ident>,
 }
 
@@ -607,6 +607,7 @@ impl Parse for Transitions {
         let mut transitions = Vec::new();
 
         let t: Transition = content.parse()?;
+        //println!("t: {:?}", t);
 
         // println!("transition: {:?}", t);
         transitions.push(t);
@@ -647,8 +648,16 @@ impl Parse for Transition {
 
         let mut async_transitions: HashSet<Ident> = HashSet::new();
 
-        let end = match input.parse::<Ident>() {
-            Ok(i) => vec![i],
+        let end: Vec<(Ident, bool)> = match input.parse::<Ident>() {
+            Ok(i) => {
+              match i.to_string().as_str() {
+                "async" => {
+                  let t: Ident = input.parse()?;
+                  vec![(t, true)]
+                }
+                _ => vec![(i, false)]
+              }
+            },
             Err(_) => {
                 let content;
                 bracketed!(content in input);
@@ -661,17 +670,19 @@ impl Parse for Transition {
                 }
 
                 let t: Ident = content.parse()?;
-                states.push(t.clone());
-                if is_async {
-                    async_transitions.insert(t);
-                }
+                states.push((t.clone(), is_async));
 
                 loop {
                     let lookahead = content.lookahead1();
                     if lookahead.peek(Token![,]) {
                         let _: Token![,] = content.parse()?;
+                        let is_async = content.peek(Token![async]);
+                        if is_async {
+                            let _: Token![async] = content.parse()?;
+                        }
+
                         let t: Ident = content.parse()?;
-                        states.push(t);
+                        states.push((t, is_async));
                     } else {
                         break;
                     }
@@ -714,7 +725,7 @@ impl Transitions {
                 &format!(
                     "{} -> {} [ label = \"{}\" ];\n",
                     edge.0,
-                    edge.2,
+                    edge.2.0,
                     edge.1.into_token_stream()
                 )
                 .as_bytes(),
@@ -794,9 +805,20 @@ pub fn transitions(input: proc_macro::TokenStream) -> syn::export::TokenStream {
             );
             let mv = moves.iter().map(|(start, end)| {
           if end.len() == 1 {
-            let end_state = &end[0];
-            quote!{
-              #machine_name::#start(state) => #machine_name::#end_state(state.#fn_ident(input)),
+            let end_state = &end[0].0;
+            let is_async = &end[0].1;
+
+            match is_async {
+              true => {
+                quote!{
+                  #machine_name::#start(state) => #machine_name::#end_state(state.#fn_ident(input).await),
+                }
+              }
+              false => {
+                quote!{
+                  #machine_name::#start(state) => #machine_name::#end_state(state.#fn_ident(input)),
+                }
+              }
             }
           } else {
             quote!{
