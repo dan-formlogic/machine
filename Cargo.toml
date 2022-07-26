@@ -8,6 +8,7 @@ license     = "MIT/Apache-2.0"
 repository  = "https://github.com/rust-bakery/machine"
 readme      = "./README.md"
 keywords    = ["state", "state-machine"]
+edition     = "2021"
 
 include = [
   "LICENSE-APACHE",

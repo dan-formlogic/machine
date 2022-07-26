@@ -409,19 +409,20 @@ extern crate syn;
 extern crate quote;
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions, create_dir};
+use std::fs::{create_dir, File, OpenOptions};
 use std::io::{Seek, Write};
 
 use case::CaseExt;
-use syn::export::Span;
-use syn::punctuated::Pair;
-use syn::parse::{Parse, ParseStream, Result};
-use syn::{
-    Abi, Attribute, Expr, FnArg, FnDecl, Generics, Ident, ItemEnum, MethodSig, ReturnType, Type,
-    WhereClause, PathArguments, GenericArgument,
-};
 use quote::ToTokens;
+use syn::export::Span;
+use syn::parse::{Parse, ParseStream, Result};
+use syn::punctuated::Pair;
+use syn::{
+    Abi, Attribute, Expr, FnArg, FnDecl, GenericArgument, Generics, Ident, ItemEnum, MethodSig,
+    PathArguments, PathSegment, ReturnType, Type, WhereClause,
+};
 
+#[derive(Debug)]
 struct Machine {
     attributes: Vec<Attribute>,
     data: ItemEnum,
@@ -466,7 +467,10 @@ fn impl_machine(m: &Machine) -> (&Ident, syn::export::TokenStream) {
 
     let machine_name = &ast.ident;
     let variants_names = &ast.variants.iter().map(|v| &v.ident).collect::<Vec<_>>();
+    let variants_attr = &ast.variants.iter().map(|v| &v.attrs).collect::<Vec<_>>();
     let structs_names = variants_names.clone();
+    let async_methods: HashMap<&Ident, bool> = HashMap::new();
+    println!("{:?}", variants_attr);
 
     // define the state enum
     let toks = quote! {
@@ -511,7 +515,20 @@ fn impl_machine(m: &Machine) -> (&Ident, syn::export::TokenStream) {
         .variants
         .iter()
         .map(|variant| {
+            // println!("variant: {:?}", variant);
             let fn_name = Ident::new(&variant.ident.to_string().to_snake(), Span::call_site());
+            let is_async: bool = variant
+                .attrs
+                .iter()
+                .flat_map(|a| -> Vec<bool> {
+                    a.path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string().as_str() == "async")
+                        .collect()
+                })
+                .collect::<Vec<bool>>()
+                .contains(&true);
             let struct_name = &variant.ident;
 
             let args = &variant
@@ -529,12 +546,22 @@ fn impl_machine(m: &Machine) -> (&Ident, syn::export::TokenStream) {
 
             let arg_names = &variant.fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
 
-            quote! {
-              pub fn #fn_name(#(#args),*) -> #machine_name {
-                #machine_name::#struct_name(#struct_name {
-                  #(#arg_names),*
-                })
-              }
+            if is_async {
+                quote! {
+                  pub async fn #fn_name(#(#args),*) -> #machine_name {
+                    #machine_name::#struct_name(#struct_name {
+                      #(#arg_names),*
+                    })
+                  }
+                }
+            } else {
+                quote! {
+                  pub fn #fn_name(#(#args),*) -> #machine_name {
+                    #machine_name::#struct_name(#struct_name {
+                      #(#arg_names),*
+                    })
+                  }
+                }
             }
         })
         .collect::<Vec<_>>();
@@ -565,6 +592,7 @@ struct Transition {
     pub start: Ident,
     pub message: Type,
     pub end: Vec<Ident>,
+    pub async_transitions: HashSet<Ident>,
 }
 
 impl Parse for Transitions {
@@ -579,6 +607,8 @@ impl Parse for Transitions {
         let mut transitions = Vec::new();
 
         let t: Transition = content.parse()?;
+
+        // println!("transition: {:?}", t);
         transitions.push(t);
 
         loop {
@@ -601,14 +631,21 @@ impl Parse for Transitions {
 
 impl Parse for Transition {
     fn parse(input: ParseStream) -> Result<Self> {
+        // println!("{:?}", input);
         let left;
         parenthesized!(left in input);
 
         let start: Ident = left.parse()?;
         let _: Token![,] = left.parse()?;
+        let is_async = left.peek(Token![async]);
+        if is_async {
+            let _: Token![async] = left.parse()?;
+        }
         let message: Type = left.parse()?;
 
         let _: Token![=>] = input.parse()?;
+
+        let mut async_transitions: HashSet<Ident> = HashSet::new();
 
         let end = match input.parse::<Ident>() {
             Ok(i) => vec![i],
@@ -618,9 +655,16 @@ impl Parse for Transition {
 
                 //println!("content: {:?}", content);
                 let mut states = Vec::new();
+                let is_async = content.peek(Token![async]);
+                if is_async {
+                    let _: Token![async] = content.parse()?;
+                }
 
                 let t: Ident = content.parse()?;
-                states.push(t);
+                states.push(t.clone());
+                if is_async {
+                    async_transitions.insert(t);
+                }
 
                 loop {
                     let lookahead = content.lookahead1();
@@ -641,6 +685,7 @@ impl Parse for Transition {
             start,
             message,
             end,
+            async_transitions,
         })
     }
 }
@@ -666,7 +711,13 @@ impl Transitions {
 
         for edge in edges.iter() {
             file.write_all(
-                &format!("{} -> {} [ label = \"{}\" ];\n", edge.0, edge.2, edge.1.into_token_stream()).as_bytes(),
+                &format!(
+                    "{} -> {} [ label = \"{}\" ];\n",
+                    edge.0,
+                    edge.2,
+                    edge.1.into_token_stream()
+                )
+                .as_bytes(),
             )
             .expect("error writing to dot file");
         }
@@ -699,8 +750,8 @@ pub fn transitions(input: proc_macro::TokenStream) -> syn::export::TokenStream {
 
     let mut type_arguments = HashSet::new();
     for t in transitions.transitions.iter() {
-      let mut args = type_args(&t.message);
-      type_arguments.extend(args.drain());
+        let mut args = type_args(&t.message);
+        type_arguments.extend(args.drain());
     }
 
     let type_arguments = reorder_type_arguments(type_arguments);
@@ -711,15 +762,17 @@ pub fn transitions(input: proc_macro::TokenStream) -> syn::export::TokenStream {
         Span::call_site(),
     );
     let structs_names = messages.keys().collect::<Vec<_>>();
-    let variants_names = structs_names.iter().map(|t| type_last_ident(*t)).collect::<Vec<_>>();
-
+    let variants_names = structs_names
+        .iter()
+        .map(|t| type_last_ident(*t))
+        .collect::<Vec<_>>();
 
     let type_arg_toks = if type_arguments.is_empty() {
-      quote!{}
+        quote! {}
     } else {
-      quote!{
-        < #(#type_arguments),* >
-      }
+        quote! {
+          < #(#type_arguments),* >
+        }
     };
 
     // define the state enum
@@ -732,14 +785,14 @@ pub fn transitions(input: proc_macro::TokenStream) -> syn::export::TokenStream {
 
     stream.extend(proc_macro::TokenStream::from(toks));
     let functions = messages
-      .iter()
-      .map(|(msg, moves)| {
-        let fn_ident = Ident::new(
-          //&format!("on_{}", &msg.to_string().to_snake()),
-          &format!("on_{}", type_to_snake(msg)),
-          Span::call_site(),
-          );
-        let mv = moves.iter().map(|(start, end)| {
+        .iter()
+        .map(|(msg, moves)| {
+            let fn_ident = Ident::new(
+                //&format!("on_{}", &msg.to_string().to_snake()),
+                &format!("on_{}", type_to_snake(msg)),
+                Span::call_site(),
+            );
+            let mv = moves.iter().map(|(start, end)| {
           if end.len() == 1 {
             let end_state = &end[0];
             quote!{
@@ -752,43 +805,42 @@ pub fn transitions(input: proc_macro::TokenStream) -> syn::export::TokenStream {
           }
         }).collect::<Vec<_>>();
 
-        let type_arguments = reorder_type_arguments(type_args(msg));
-        let type_arg_toks = if type_arguments.is_empty() {
-          quote!{}
-        } else {
-          quote!{
-            < #(#type_arguments),* >
-          }
-        };
+            let type_arguments = reorder_type_arguments(type_args(msg));
+            let type_arg_toks = if type_arguments.is_empty() {
+                quote! {}
+            } else {
+                quote! {
+                  < #(#type_arguments),* >
+                }
+            };
 
-        quote! {
-          pub fn #fn_ident #type_arg_toks(self, input: #msg) -> #machine_name {
-            match self {
-              #(#mv)*
-              _ => #machine_name::Error,
+            quote! {
+              pub fn #fn_ident #type_arg_toks(self, input: #msg) -> #machine_name {
+                match self {
+                  #(#mv)*
+                  _ => #machine_name::Error,
+                }
+              }
             }
-          }
-        }
-      })
-    .collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
 
     let matches = messages
-      .keys()
-      .map(|msg| {
-        let fn_ident = Ident::new(
-          //&format!("on_{}", &msg.to_string().to_snake()),
-          &format!("on_{}", type_to_snake(msg)),
-          Span::call_site(),
-          );
+        .keys()
+        .map(|msg| {
+            let fn_ident = Ident::new(
+                //&format!("on_{}", &msg.to_string().to_snake()),
+                &format!("on_{}", type_to_snake(msg)),
+                Span::call_site(),
+            );
 
-          let id = type_last_ident(msg);
+            let id = type_last_ident(msg);
 
-          quote!{
-            #message_enum_ident::#id(message) => self.#fn_ident(message),
-          }
-
-      })
-    .collect::<Vec<_>>();
+            quote! {
+              #message_enum_ident::#id(message) => self.#fn_ident(message),
+            }
+        })
+        .collect::<Vec<_>>();
 
     /*let type_arg_toks = if type_arguments.is_empty() {
       quote!{}
@@ -820,7 +872,10 @@ pub fn transitions(input: proc_macro::TokenStream) -> syn::export::TokenStream {
     //println!("generated: {:?}", gen);
     trace!("generated transitions: {}", stream);
     let _ = create_dir("target/machine");
-    let file_name = format!("target/machine/{}.rs", machine_name.to_string().to_lowercase());
+    let file_name = format!(
+        "target/machine/{}.rs",
+        machine_name.to_string().to_lowercase()
+    );
     OpenOptions::new()
         .create(true)
         .write(true)
@@ -1031,7 +1086,10 @@ pub fn methods(input: proc_macro::TokenStream) -> syn::export::TokenStream {
 
     stream.extend(proc_macro::TokenStream::from(toks));
 
-    let file_name = format!("target/machine/{}.rs", machine_name.to_string().to_lowercase());
+    let file_name = format!(
+        "target/machine/{}.rs",
+        machine_name.to_string().to_lowercase()
+    );
     let _ = create_dir("target/machine");
     OpenOptions::new()
         .create(true)
@@ -1219,66 +1277,52 @@ fn parse_method_sig(input: ParseStream) -> Result<MethodSig> {
 }
 
 fn type_to_snake(t: &Type) -> String {
-  match t {
-    Type::Path(ref p) => {
-      match p.path.segments.last() {
-        Some(Pair::End(segment)) => {
-          segment.ident.to_string().to_snake()
+    match t {
+        Type::Path(ref p) => match p.path.segments.last() {
+            Some(Pair::End(segment)) => segment.ident.to_string().to_snake(),
+            _ => panic!("expected a path segment"),
         },
-        _ => panic!("expected a path segment"),
-      }
-    },
-    t => panic!("expected a Type::Path, got {:?}", t),
-  }
+        t => panic!("expected a Type::Path, got {:?}", t),
+    }
 }
 
 fn type_last_ident(t: &Type) -> &Ident {
-  match t {
-    Type::Path(ref p) => {
-      match p.path.segments.last() {
-        Some(Pair::End(segment)) => {
-          &segment.ident
+    match t {
+        Type::Path(ref p) => match p.path.segments.last() {
+            Some(Pair::End(segment)) => &segment.ident,
+            _ => panic!("expected a path segment"),
         },
-        _ => panic!("expected a path segment"),
-      }
-    },
-    t => panic!("expected a Type::Path, got {:?}", t),
-  }
+        t => panic!("expected a Type::Path, got {:?}", t),
+    }
 }
 
 fn type_args(t: &Type) -> HashSet<GenericArgument> {
-  match t {
-    Type::Path(ref p) => {
-      match p.path.segments.last() {
-        Some(Pair::End(segment)) => {
-          match &segment.arguments {
-            PathArguments::AngleBracketed(a) => {
-              a.args.iter().cloned().collect()
+    match t {
+        Type::Path(ref p) => match p.path.segments.last() {
+            Some(Pair::End(segment)) => match &segment.arguments {
+                PathArguments::AngleBracketed(a) => a.args.iter().cloned().collect(),
+                PathArguments::None => HashSet::new(),
+                a => panic!("expected angle bracketed arguments, got {:?}", a),
             },
-            PathArguments::None => HashSet::new(),
-            a => panic!("expected angle bracketed arguments, got {:?}", a),
-          }
+            _ => panic!("expected a path segment"),
         },
-        _ => panic!("expected a path segment"),
-      }
-    },
-    t => panic!("expected a Type::Path, got {:?}", t),
-  }
+        t => panic!("expected a Type::Path, got {:?}", t),
+    }
 }
 
 // lifetimes must appear before other type arguments
 fn reorder_type_arguments(mut t: HashSet<GenericArgument>) -> Vec<GenericArgument> {
-  let mut lifetimes = Vec::new();
-  let mut others = Vec::new();
+    let mut lifetimes = Vec::new();
+    let mut others = Vec::new();
 
-  for arg in t.drain() {
-    if let GenericArgument::Lifetime(_) = arg {
-      lifetimes.push(arg);
-    } else {
-      others.push(arg);
+    for arg in t.drain() {
+        if let GenericArgument::Lifetime(_) = arg {
+            lifetimes.push(arg);
+        } else {
+            others.push(arg);
+        }
     }
-  }
 
-  lifetimes.extend(others.drain(..));
-  lifetimes
+    lifetimes.extend(others.drain(..));
+    lifetimes
 }
